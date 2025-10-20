@@ -1,0 +1,39 @@
+# Base dependencies
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.22.0
+datasets>=2.13.0
+evaluate>=0.4.0
+peft>=0.4.0
+bitsandbytes>=0.40.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+
+# Lightning dependencies for continual pre-training
+lightning>=2.0.0
+pytorch-lightning>=2.0.0
+lightning-fabric>=2.0.0
+
+# TRL for instruction tuning
+trl>=0.7.0
+
+# Data processing
+sentencepiece>=0.1.99
+tokenizers>=0.13.3
+pyarrow>=12.0.0
+
+# Utilities
+jsonschema>=4.17.3
+wandb>=0.15.0
+tensorboard>=2.13.0
+safetensors>=0.3.1
+
+# For logging and monitoring
+psutil>=5.9.0
+
+# For JSON handling in seq2seq approach
+ujson>=5.7.0
