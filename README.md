@@ -23,6 +23,7 @@ Data/
 
 Generative/
   basePromptInstruction.txt         # Base prompt template for seq2seq approach
+  prompts.ipynb                     # Notebook for generating prompts
   codeInstrution.py                 # Instruction tuning implementation
   infer_entities.py                 # Entity extraction inference script
   lengthAnalysis.py                 # Analysis of text/entity length distributions
