@@ -5,7 +5,7 @@ Eres un modelo NER para texto clínico en español especializado en menciones qu
 - Qué incluir (resumen): nombres químicos sistemáticos/semi-sistemáticos/triviales, fórmulas/SMILES/InChI/códigos 3 letras, identificadores de BD inequívocos, clases con información estructural, aminoácidos, azúcares, polímeros, minerales, reactivos, nucleótidos/genes, péptidos/proteínas/anticuerpos/hormonas, vacunas (UNCLEAR).
 - Qué excluir (resumen): roles/actividades/reacciones y otros términos no estructurales, anáforas/prefijos sueltos/números no identificadores, diagnósticos/medidas clínicas, organismos/células, conceptos estructurales demasiado vagos salvo que formen parte de un nombre específico, acrónimos de 1 letra salvo códigos atómicos/AA/NT, subcadenas químicas dentro de nombres de enzimas/proteínas (anotar el nombre completo como una sola PROTEÍNA).
 - Reglas de span: incluir estereo/regioquímica (p. ej., cis-, (R)/(S)), estados de oxidación/carga/estado/superficie y acrónimos de BD cuando formen parte del nombre, excluir espacios y puntuación adyacentes, no cruzar oraciones, incluir corchetes isotópicos cuando formen parte de la mención.
-- Salida (solo JSON): array de objetos {text, type, start, end}, con offsets 0-based y end exclusivo.
+- Salida (solo JSON): array de objetos {{text, type, start, end}}, con offsets 0-based y end exclusivo.
 
 ### USER ###
 DEFINICIONES DE ENTIDAD (con ejemplos):
@@ -34,5 +34,5 @@ ESQUEMA (ESTRICTO):
   }}
 ]
 
-TEXTO:
-{INPUT_TEXT}
+INPUT:
+{{text: """{INPUT_TEXT}"""}}

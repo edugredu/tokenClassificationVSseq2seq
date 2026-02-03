@@ -4,20 +4,25 @@
 import os
 import re
 import json
+import unicodedata
 import torch
 import argparse
+import threading 
 import numpy as np
 import time
 from datasets import load_dataset
+from collections import defaultdict
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig, get_peft_model
-from typing import Dict, List, Tuple
+from typing import Dict, Any, List, Set, Tuple
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     EarlyStoppingCallback,
+    Trainer,
     StoppingCriteria,
-    StoppingCriteriaList
+    StoppingCriteriaList,
+    set_seed
 )
 
 
@@ -28,21 +33,73 @@ def is_rank0():
         return True
 
 
+def ensure_chat_template(tokenizer, model_id: str, hf_token: str = ""):
+    if getattr(tokenizer, "chat_template", None):
+        return
+
+    model_id_lower = model_id.lower()
+    fallback_id = None
+    if ("llama2" in model_id_lower or "llama-2-7b" in model_id_lower) and "chat" not in model_id_lower:
+        fallback_id = "meta-llama/Llama-2-7b-chat-hf"
+    elif ("llama3_2" in model_id_lower or "llama-3.2-3b" in model_id_lower) and "instruct" not in model_id_lower:
+        fallback_id = "meta-llama/Llama-3.2-3B-Instruct"
+    elif ("llama3_1" in model_id_lower or "llama-3.1-8b" in model_id_lower) and "instruct" not in model_id_lower:
+        fallback_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    elif ("llama3" in model_id_lower or "llama-3-8b" in model_id_lower) and "instruct" not in model_id_lower:
+        fallback_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+    if not fallback_id:
+        if is_rank0():
+            print("Warning: tokenizer.chat_template missing and no fallback found.")
+        return
+
+    try:
+        fallback_tok = AutoTokenizer.from_pretrained(
+            fallback_id,
+            use_fast=True,
+            token=hf_token or None,
+        )
+    except Exception as exc:
+        if is_rank0():
+            print(f"Warning: failed to load fallback tokenizer {fallback_id}: {exc}")
+        return
+
+    if getattr(fallback_tok, "chat_template", None):
+        tokenizer.chat_template = fallback_tok.chat_template
+        if is_rank0():
+            print(f"Applied chat_template from {fallback_id}")
+    else:
+        if is_rank0():
+            print(f"Warning: fallback tokenizer {fallback_id} has no chat_template")
+
+
 class JSONStoppingCriteria(StoppingCriteria):
     """Custom stopping criteria for JSON completion during validation."""
     
     def __init__(self, tokenizer, max_entities=30):
         self.tokenizer = tokenizer
         self.max_entities = max_entities
+        self.start_length = None
         
     def __call__(self, input_ids, scores, **kwargs):
+        if self.start_length is None:
+            self.start_length = input_ids.shape[1]
+            return False
+
         if input_ids.shape[1] < 10:
             return False
-            
-        last_tokens = input_ids[0][-30:]
+
+        if input_ids.shape[1] <= self.start_length:
+            return False
+
+        generated = input_ids[0][self.start_length:]
+        if generated.shape[0] < 5:
+            return False
+
+        last_tokens = generated[-30:]
         try:
-            text = self.processing_class.decode(last_tokens, skip_special_tokens=True)
-        except:
+            text = self.tokenizer.decode(last_tokens, skip_special_tokens=True)
+        except Exception:
             return False
         
         open_brackets = text.count('[')
@@ -65,22 +122,54 @@ class JSONStoppingCriteria(StoppingCriteria):
 def fix_entity_type(entity_type: str) -> str:
     """Fix common entity type errors and normalize to standard types."""
     type_corrections = {
-        "PROTEÌNAS": "PROTEINAS", "PROTÈINAS": "PROTEINAS", "PROTÊINAS": "PROTEINAS", 
-        "PROTIÈNAS": "PROTEINAS", "PROTE ÎNAS": "PROTEINAS", "PROT ÈINAS": "PROTEINAS",
-        "PROTINAS": "PROTEINAS", "PROTEINAS ": "PROTEINAS", " PROTEINAS": "PROTEINAS",
-        
-        "NORMALIZABLENS": "NORMALIZABLES", "NORMALÍZABLES": "NORMALIZABLES",
-        "NORMALÍZAABLES": "NORMALIZABLES", "NOMINALIZED": "NORMALIZABLES",
-        "NORMALISABLES": "NORMALIZABLES", "NO NORMALIZABLES": "NO_NORMALIZABLES",
-        "NO NORMALÍZARES": "NO_NORMALIZABLES", "NO NORMALISABLES": "NO_NORMALIZABLES",
-        
-        "NCLEA": "UNCLEAR", "NCLER": "UNCLEAR", "NCLEAR": "UNCLEAR", "UCLER": "UNCLEAR",
-        "UCLEA": "UNCLEAR", "UNC Leer": "UNCLEAR", "UNCLER": "UNCLEAR", "UNCLEA": "UNCLEAR",
-        "UNCLEAR ": "UNCLEAR", " UNCLEAR": "UNCLEAR"
+        "PROTEINAS ": "PROTEINAS",
+        " PROTEINAS": "PROTEINAS",
+        "PROTÌNAS": "PROTEINAS",
+        "PROTÈINAS": "PROTEINAS",
+        "PROTÊINAS": "PROTEINAS",
+        "PROTIÈNAS": "PROTEINAS",
+        "PROTE ÎNAS": "PROTEINAS",
+        "PROT ÈINAS": "PROTEINAS",
+        "PROTINAS": "PROTEINAS",
+        "NORMALIZABLENS": "NORMALIZABLES",
+        "NORMALIZABLES ": "NORMALIZABLES",
+        " NORMALIZABLES": "NORMALIZABLES",
+        "NORMALIZABLES.": "NORMALIZABLES",
+        "NORMALIZABLES,": "NORMALIZABLES",
+        "NORMALISABLES": "NORMALIZABLES",
+        "NO NORMALIZABLES": "NO_NORMALIZABLES",
+        "NO NORMALISABLES": "NO_NORMALIZABLES",
+        "NCLEA": "UNCLEAR",
+        "NCLER": "UNCLEAR",
+        "NCLEAR": "UNCLEAR",
+        "UCLER": "UNCLEAR",
+        "UCLEA": "UNCLEAR",
+        "UNCLER": "UNCLEAR",
+        "UNCLEA": "UNCLEAR",
+        "UNCLEAR ": "UNCLEAR",
+        " UNCLEAR": "UNCLEAR",
     }
     
     cleaned = entity_type.strip().upper()
-    return type_corrections.get(cleaned, cleaned if cleaned in ["PROTEINAS", "NORMALIZABLES", "NO_NORMALIZABLES", "UNCLEAR"] else "UNCLEAR")
+    cleaned = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.replace(" ", "_").replace("-", "_")
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    cleaned = type_corrections.get(cleaned, cleaned)
+    if cleaned in ["PROTEINAS", "NORMALIZABLES", "NO_NORMALIZABLES", "UNCLEAR"]:
+        return cleaned
+
+    compact = cleaned.replace("_", "")
+    if compact == "PROTEINAS":
+        return "PROTEINAS"
+    if compact == "NORMALIZABLES":
+        return "NORMALIZABLES"
+    if compact == "NONORMALIZABLES":
+        return "NO_NORMALIZABLES"
+    if compact == "UNCLEAR":
+        return "UNCLEAR"
+
+    return "UNCLEAR"
 
 
 def fix_entity_positions(entities: List[Dict], input_text: str) -> List[Dict]:
@@ -110,11 +199,14 @@ def fix_entity_positions(entities: List[Dict], input_text: str) -> List[Dict]:
 def truncate_at_valid_json(text: str) -> str:
     """Truncate text at the first complete, valid JSON array."""
     try:
+        start_idx = text.find("[")
+        if start_idx == -1:
+            return text
         bracket_count = 0
         in_string = False
         escape_next = False
         
-        for i, char in enumerate(text):
+        for i, char in enumerate(text[start_idx:], start=start_idx):
             if escape_next:
                 escape_next = False
                 continue
@@ -133,7 +225,7 @@ def truncate_at_valid_json(text: str) -> str:
                 elif char == ']':
                     bracket_count -= 1
                     if bracket_count == 0:
-                        potential_json = text[:i+1]
+                        potential_json = text[start_idx:i+1]
                         try:
                             json.loads(potential_json)
                             return potential_json
@@ -263,10 +355,10 @@ class GenerativeEvaluationTrainer(SFTTrainer):
         self.gen_kwargs = {
             "max_new_tokens": self.generation_config.get("max_new_tokens", 512),
             "do_sample": False,
-            "num_beams": 4,
+            "num_beams": 1,
             "top_p": None,
-            "repetition_penalty": 1.3,
-            "no_repeat_ngram_size": 4,
+            "repetition_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
             "early_stopping": True,
             "pad_token_id": self.processing_class.pad_token_id,
             "eos_token_id": self.processing_class.eos_token_id,
@@ -349,6 +441,9 @@ class GenerativeEvaluationTrainer(SFTTrainer):
                     input_len = inputs["input_ids"].shape[1]
                     
                     # Generate
+                    for criterion in self.stopping_criteria:
+                        if hasattr(criterion, "start_length"):
+                            criterion.start_length = None
                     start_time = time.time()
                     outputs = self.model.generate(
                         **inputs,
@@ -433,6 +528,34 @@ class GenerativeEvaluationTrainer(SFTTrainer):
             aggregated = {f"{metric_key_prefix}_entity_f1_exact": 0.0}
         
         return aggregated
+
+    def _load_best_model(self):
+        """Load best model on CPU to avoid GPU OOM at the end of training."""
+        if not getattr(self.state, "best_model_checkpoint", None):
+            return
+
+        if is_rank0():
+            print("Loading best model on CPU to avoid GPU OOM...")
+
+        try:
+            self.model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        super()._load_best_model()
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Override to skip TRL entropy computation (reduces memory usage)."""
+        inputs["use_cache"] = False
+        return Trainer.compute_loss(
+            self,
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
     
     def _create_empty_metrics(self, ground_truth):
         """Create empty metrics for failed samples."""
@@ -493,11 +616,12 @@ def parse_template(path: str) -> Dict[str, str]:
     return {"system": system_tmpl, "user": user_tmpl}
 
 
-def build_formatting_fn(tokenizer, system_tmpl, user_tmpl, dump_path=""):
+def build_formatting_fn(tokenizer, system_tmpl, user_tmpl, dump_path="", dump_max=3):
     """Build formatting function for training data."""
     import json, io, os, threading
     lock = threading.Lock()
     dump_fh = None
+    dump_count = {"n": 0}
     if dump_path:
         os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
         dump_fh = io.open(dump_path, "a", encoding="utf-8")
@@ -519,6 +643,26 @@ def build_formatting_fn(tokenizer, system_tmpl, user_tmpl, dump_path=""):
         sys_text = system_tmpl.format_map(sd)
         usr_text = user_tmpl.format_map(sd).strip()
         gold_asst = normalize_asst(example.get("assistant", ""))
+
+        if dump_fh and dump_count["n"] < dump_max:
+            prompt_text = tokenizer.apply_chat_template(
+                [
+                    {"role": "system",    "content": sys_text},
+                    {"role": "user",      "content": usr_text},
+                    {"role": "assistant", "content": ""}
+                ],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            with lock:
+                if dump_count["n"] < dump_max:
+                    dump_fh.write(f"### SAMPLE {dump_count['n']}\n")
+                    dump_fh.write("PROMPT:\n")
+                    dump_fh.write(prompt_text + "\n")
+                    dump_fh.write("ASSISTANT:\n")
+                    dump_fh.write(gold_asst + "\n\n")
+                    dump_fh.flush()
+                    dump_count["n"] += 1
 
         prompt_tokens = tokenizer.apply_chat_template(
             [
@@ -569,7 +713,7 @@ def wrap_lora(model, use_lora: bool, lora_r: int, lora_alpha: int, lora_dropout:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced Instruction Tuning with Generative Evaluation")
+    parser = argparse.ArgumentParser(description="Fixed Enhanced Instruction Tuning with Generative Evaluation")
 
     # Required I/O
     parser.add_argument("--model_path", type=str, required=True)
@@ -622,11 +766,18 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--dump_prompts", type=str, default="")
     parser.add_argument("--debug_generation", action="store_true", default=True)
+    parser.add_argument(
+        "--use_fallback_chat_template",
+        action="store_true",
+        help="Load chat_template from an instruct/chat tokenizer when missing.",
+    )
+    parser.add_argument("--seed", type=int, default=1234)
 
     args = parser.parse_args()
+    set_seed(args.seed)
 
     if is_rank0():
-        print("Starting Enhanced Training with Generative Evaluation")
+        print("Starting FIXED Enhanced Training with Generative Evaluation")
         print("="*60)
         print(f"Model: {args.model_path}")
         print(f"Training samples: Loading from {args.train_path}")
@@ -639,6 +790,8 @@ def main():
 
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+    if args.use_fallback_chat_template:
+        ensure_chat_template(tokenizer, args.model_path, os.environ.get("HF_TOKEN", ""))
     if tokenizer.pad_token is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -666,7 +819,7 @@ def main():
         lora_dropout=args.lora_dropout
     )
 
-    # Parse template
+    # Parse template - CRITICAL FIX
     tmpl = parse_template(args.template_path)
     system_tmpl = tmpl["system"]
     user_tmpl = tmpl["user"]
@@ -736,7 +889,9 @@ def main():
         dataloader_pin_memory=False,
         eval_accumulation_steps=1,
         remove_unused_columns=False,
-        dataset_text_field="INPUT_TEXT",
+        dataset_text_field=None,
+        dataset_kwargs={"skip_prepare_dataset": True},
+        packing=False,
         gradient_checkpointing=False,
         ddp_find_unused_parameters=False
     )
@@ -747,7 +902,7 @@ def main():
         "temperature": args.eval_temperature
     }
 
-    # Create custom trainer with generative evaluation
+    # Create custom trainer with generative evaluation - PASS TEMPLATES
     trainer = GenerativeEvaluationTrainer(
         model=model,
         args=training_args,
@@ -756,14 +911,14 @@ def main():
         processing_class=tokenizer,
         generation_config=generation_config,
         max_eval_samples=args.max_eval_samples,
-        system_template=system_tmpl,
-        user_template=user_tmpl,
+        system_template=system_tmpl,  # CRITICAL: Pass actual templates
+        user_template=user_tmpl,      # CRITICAL: Pass actual templates
         debug_generation=args.debug_generation,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],  # Increased patience
     )
 
     if is_rank0():
-        print(f"\\nStarting training with generative evaluation...")
+        print(f"\\nStarting training with FIXED generative evaluation...")
         print(f"Evaluation will be performed every {args.eval_steps} steps")
         print(f"Best model metric: {args.metric_for_best_model}")
         print(f"Early stopping patience: 5 evaluations")
