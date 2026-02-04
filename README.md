@@ -102,6 +102,10 @@ cd Generative
 ./runInference_instructedBase.sh
 ```
 
+## Model availability
+
+All trained models (continually pre-trained, token classification fine-tuned, and instruction-tuned) will be available upon request, as they are a huge set of files. Please contact the author for access.
+
 ## Citation
 
 To be added upon publication.
